@@ -1,7 +1,7 @@
 import pandas as pd 
 import config
 import Data_Importation as DI
-import Data_Vizualisation as DV 
+import Data_Visualization as DV 
 import Distribution_Portfolio as DP
 import Portfolio_Optimization as PO
 
@@ -9,7 +9,9 @@ import Portfolio_Optimization as PO
 #######################################################################
 ##This script aim to manage all the program                          ##
 #######################################################################
+"""
 def ask():
+
     config.path_folder = str(input("What is the path leading to the folder : ")) #What folder is use
     config.total_amount = float(input("What is the wage to invest : "))#What wage of money will be use
     config.distribution = str(input("The distribution is uniform ? (y or n) :"))#Use a uniform distribution 
@@ -37,13 +39,13 @@ def ask():
     if x.strip().isdigit()
     ]
     return ( config.path_folder, config.total_amount, config.confidence_level, config.distribution, config.distribution_value )
-
+"""
 
 
 ######## Run Programm
 if __name__ == "__main__": 
     
-    ask() # initialise config.*
+    #ask() # initialise config.*
 
     #If there is O/H/L/C/V
     if len(DI.load_data()) == 5 :
@@ -90,5 +92,9 @@ if __name__ == "__main__":
     })
     
     #Set the ploting
-    DV.Data_Vizualisation(df_portfolio_close,config.confidence_level,config.periods_SMA,config.periods_EMA,DataFrame_Amount_Each_Value)
+    DV.Data_Visualization(df_portfolio_close,DataFrame_Amount_Each_Value,
+                          Confidence_level =config.confidence_level,periods_SMA =config.periods_SMA,
+                          periods_EMA = config.periods_EMA,
+                          Portfolio_Distribution = config.optimization_value,
+                          RSI = config.RSI).plot_graph()
     

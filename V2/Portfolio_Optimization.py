@@ -19,7 +19,7 @@ def Optimization(DataFrame):
     objective = cp.Minimize(cp.quad_form(weight_asset,cov_dataframe))
 
     constraints = [
-        cp.sum(weight_asset)==1,  #Sum of wheight must be one
+        cp.sum(weight_asset)<=1,  #Sum of wheight must be one
         weight_asset >= 0.01,                 #No short selling
         weight_asset <= 0.10               #Max lenght: 5%
     ]   

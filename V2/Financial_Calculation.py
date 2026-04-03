@@ -118,7 +118,6 @@ def SMA(DataFrame, periods):
 def EMA(DataFrame,periods) : 
     return DataFrame.ewm(span =int(periods), adjust = False).mean()
 
-
 #Relative Strength Index 
 def RSI_portfolio(DataFrame): 
     period = 14
