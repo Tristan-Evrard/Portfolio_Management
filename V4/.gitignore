@@ -1,0 +1,14 @@
+# Environnement virtuel
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers système
+.DS_Store
+Thumbs.db
