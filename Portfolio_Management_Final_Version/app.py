@@ -1,13 +1,3 @@
-"""
-app.py  —  Portfolio Manager · Application GUI unifiée
-Lance ce fichier : python app.py
-
-Contient :
-  • Wizard de configuration (3 étapes)
-  • Dashboard avec onglets (VaR, SMA, EMA, RSI, Distribution, Frontière efficiente)
-  • Tout embarqué dans une seule fenêtre Tkinter — aucune fenêtre matplotlib externe
-"""
-
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
@@ -68,9 +58,8 @@ def mpl_style():
     })
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FINANCIAL CALCULATIONS (standalone — pas besoin des fichiers externes)
-# ══════════════════════════════════════════════════════════════════════════════
+#FINANCIAL CALCULATION
+
 def calc_var(series, confidence):
     returns = series.pct_change().dropna()
     return float(np.percentile(returns, (1 - confidence) * 100))
@@ -733,7 +722,7 @@ class App:
         ax_tbl = fig.add_subplot(gs[0, 0])
         ax_bar = fig.add_subplot(gs[0, 1])
 
-        # ── Tableau propre ────────────────────────────────────────────────────
+        # ── DataFrame────────────────────────────────────────────────────
         ax_tbl.set_facecolor(MP["panel"]); ax_tbl.axis("off")
         col_labels = ["Qty", "Amount (€)"]
         cell_vals  = [[str(r["Qty"]), f"€{r['Amount (€)']:,.2f}"]
