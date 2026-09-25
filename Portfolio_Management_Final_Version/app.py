@@ -94,6 +94,51 @@ def calc_rsi(series, period=14):
         values.append(100 - 100 / (1 + rs))
     return values
 
+# ── CAC 40 data (Yahoo Finance via yfinance, no API key) ─────────────────────
+# Index composition changes over time: tickers without data are skipped.
+CAC40_TICKERS = [
+    "AC.PA", "AI.PA", "AIR.PA", "MT.AS", "CS.PA", "BNP.PA", "EN.PA", "BVI.PA",
+    "CAP.PA", "CA.PA", "ACA.PA", "BN.PA", "DSY.PA", "EDEN.PA", "ENGI.PA", "EL.PA",
+    "ERF.PA", "RMS.PA", "KER.PA", "OR.PA", "LR.PA", "MC.PA", "ML.PA", "ORA.PA",
+    "RI.PA", "PUB.PA", "RNO.PA", "SAF.PA", "SGO.PA", "SAN.PA", "SU.PA", "GLE.PA",
+    "STLAP.PA", "STMPA.PA", "TEP.PA", "HO.PA", "TTE.PA", "URW.PA", "VIE.PA", "DG.PA",
+]
+
+def download_cac40(path, period="1y"):
+    """
+    Download daily OHLCV of the CAC 40 constituents and save it as a CSV in the
+    format the app reads (Date, <TICKER>_Open/High/Low/Close/Volume).
+    Returns (tickers kept, tickers skipped).
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise RuntimeError("CAC 40 download needs yfinance:  pip install yfinance")
+
+    raw = yf.download(CAC40_TICKERS, period=period, interval="1d", group_by="ticker",
+                      auto_adjust=True, progress=False, threads=True)
+    if raw is None or raw.empty:
+        raise RuntimeError("Yahoo Finance returned no data (check your connection).")
+
+    fields = ["Open", "High", "Low", "Close", "Volume"]
+    cols, kept, skipped = {}, [], []
+    for t in CAC40_TICKERS:
+        if t not in raw.columns.get_level_values(0) or raw[t]["Close"].notna().sum() < 30:
+            skipped.append(t)
+            continue
+        kept.append(t)
+        for f in fields:
+            cols[f"{t}_{f}"] = raw[t][f]
+    if len(kept) < 2:
+        raise RuntimeError("Not enough CAC 40 tickers returned data.")
+
+    df = pd.DataFrame(cols)
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    df.index.name = "Date"
+    df = df.ffill().dropna()     # align trading days, drop the leading gaps
+    df.to_csv(path, date_format="%Y-%m-%d")
+    return kept, skipped
+
 def portfolio_perf(w, mu, cov, td=252):
     r = np.dot(w, mu) * td
     v = np.sqrt(w @ cov @ w) * np.sqrt(td)
@@ -849,6 +894,10 @@ class App:
         tk.Button(row, text="Browse…", font=FL, fg=C["bg"], bg=C["accent"],
                   relief="flat", padx=12, pady=5, cursor="hand2",
                   command=browse).pack(side="left", padx=8)
+        self._cac_btn = tk.Button(row, text="CAC 40 · 1Y (Yahoo)", font=FL, fg=C["bg"],
+                                  bg=C["accent2"], relief="flat", padx=12, pady=5,
+                                  cursor="hand2", command=self._load_cac40)
+        self._cac_btn.pack(side="left")
         self._path_entry = ee
 
         _sec(sec, "TOTAL INVESTMENT (€)")
@@ -1008,6 +1057,36 @@ class App:
     # ══════════════════════════════════════════════════════════════════════════
     #  RUN PIPELINE
     # ══════════════════════════════════════════════════════════════════════════
+    def _load_cac40(self):
+        """Download the last year of CAC 40 data in the background and select it."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            f"CAC40_1y_{pd.Timestamp.now():%Y%m%d}.csv")
+        self._cac_btn.config(state="disabled")
+        self._set_status("Downloading CAC 40 from Yahoo Finance…")
+
+        def work():
+            try:
+                kept, skipped = download_cac40(path)
+            except Exception as ex:
+                self.root.after(0, lambda m=str(ex): (
+                    self._cac_btn.config(state="normal"),
+                    self._set_status("✗ CAC 40 download failed"),
+                    messagebox.showerror("CAC 40 download", m)))
+                return
+
+            def done():
+                self._cac_btn.config(state="normal")
+                self.v_path.set(path)
+                self._path_entry.config(fg=C["text"])
+                self._set_status(f"✔ CAC 40 loaded · {len(kept)} stocks")
+                if skipped:
+                    messagebox.showinfo("CAC 40 download",
+                                        f"{len(kept)} stocks loaded.\n"
+                                        f"No data for: {', '.join(skipped)}")
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _run(self):
         if not os.path.isfile(self.v_path.get()):
             messagebox.showerror("Missing file", "Please select a valid CSV file.")
