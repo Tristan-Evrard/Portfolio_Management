@@ -41,7 +41,7 @@ MP = {  # matplotlib palette
     "bg": "#0A0E17", "panel": "#111827", "border": "#1E3A5F",
     "text": "#F1F5F9", "sub": "#64748B", "accent": "#0EA5E9",
     "accent2": "#10B981", "accent3": "#F59E0B", "danger": "#EF4444",
-    "pos": "#34D399", "grid": "#1C2535",
+    "pos": "#34D399", "grid": "#1C2535", "muted": "#1E293B",
     "sma1": "#38BDF8", "sma2": "#FFA657", "ema1": "#C084FC", "ema2": "#FB7185",
 }
 FL = ("Courier New", 9,  "bold")   # font label
@@ -144,6 +144,48 @@ def ucits_check(weights, tol=1e-6):
     ok = max_w <= UCITS_MAX_SINGLE + tol and big_sum <= UCITS_MAX_SUM + tol
     return ok, max_w, big_sum
 
+def ucits_whole_shares(prices, amounts, budget, tol=1e-6, rounds=200):
+    """
+    Turn UCITS target amounts into whole-share quantities that still comply.
+
+    Plain rounding down leaves cash aside, so the invested total is below the
+    budget and every weight grows: assets optimised at exactly 5% / 10% end up
+    just above the limit. Here the caps are measured against an estimate V of
+    the invested total: allocate shares under those caps, then set V to what
+    was actually invested and repeat until the two match.
+    """
+    p = np.asarray(prices, dtype=float)
+    target = np.asarray(amounts, dtype=float)
+    safe_p = np.where(p > 0, p, np.inf)
+    big = target / budget > UCITS_THRESHOLD + tol     # assets allowed up to 10%
+    cap = np.where(big, UCITS_MAX_SINGLE, UCITS_THRESHOLD)
+
+    V = budget
+    for _ in range(rounds):
+        # Bulk allocation: each asset up to min(target, cap·V), big group ≤ 40%·V
+        want = np.minimum(target, cap * V)
+        if want[big].sum() > UCITS_MAX_SUM * V:
+            want[big] *= UCITS_MAX_SUM * V / want[big].sum()
+        q = np.floor(want / safe_p).astype(int)
+
+        # Top-up: spend leftover cash on the most under-filled assets
+        while True:
+            v = q * p
+            new_v = v + p
+            ok = ((p > 0) & (p <= budget - v.sum())
+                  & (new_v <= cap * V + tol) & (new_v <= target + p))
+            if big.any():
+                ok &= v[big].sum() + p * big <= UCITS_MAX_SUM * V + tol
+            if not ok.any():
+                break
+            q[int(np.argmax(np.where(ok, target - v, -np.inf)))] += 1
+
+        invested = float((q * p).sum())
+        if invested <= 0 or ucits_check(q * p, tol)[0]:
+            break
+        V = invested    # caps were too loose for what we actually invested
+    return q.tolist()
+
 def _max_sharpe_bounded(mu, cov, bounds, extra_cons=(), restarts=10):
     """Max-Sharpe SLSQP with custom bounds/constraints. Returns None on failure."""
     n = len(mu)
@@ -243,6 +285,312 @@ def markowitz_optimize(df_close, total, min_assets=1, ucits=False):
         ws = ws / ws.sum()  # renormalise
 
     return (ws * total).tolist()
+
+def dashboard_metrics(mu, cov, weights, n_days, conf, port_rets, td=252):
+    """Dashboard KPIs — shared by the Dashboard panel and the Excel export."""
+    port_mu_d  = float(np.dot(weights, mu))               # daily drift
+    port_sig_d = float(np.sqrt(weights @ cov @ weights))  # daily vol
+
+    recent    = port_rets.iloc[-21:] if len(port_rets) >= 21 else port_rets
+    cur_vol   = float(recent.std() * np.sqrt(td))         # realised, last 21 days
+    est_vol   = port_sig_d * np.sqrt(td)
+    est_perf  = float(np.exp(port_mu_d * n_days) - 1)     # log-normal mean
+    var_daily = float(np.percentile(port_rets.dropna(), (1 - conf) * 100))
+    var_horiz = var_daily * np.sqrt(n_days)               # square-root scaling
+    sharpe    = (port_mu_d * td) / (port_sig_d * np.sqrt(td)) if port_sig_d > 0 else 0.0
+
+    # Risk indicator (0-10 composite): vol, VaR severity, inverse Sharpe
+    vol_score  = min(10, (est_vol / 0.40) * 10)           # 40% vol → score 10
+    var_score  = min(10, (abs(var_horiz) / 0.30) * 10)    # 30% horizon VaR → 10
+    shrp_score = max(0, 10 - abs(sharpe) * 2)
+    risk = round(vol_score * 0.45 + var_score * 0.35 + shrp_score * 0.20, 1)
+    risk = min(10, max(0, risk))
+    label = "LOW" if risk <= 3 else "MEDIUM" if risk <= 6 else "HIGH"
+
+    return {"est_perf": est_perf, "est_vol": est_vol, "cur_vol": cur_vol,
+            "var_horizon": var_horiz, "sharpe": sharpe,
+            "risk_score": risk, "risk_label": label}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  EXCEL EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
+XL_PCT, XL_EUR, XL_NUM = "0.00%", '#,##0.00 "€"', "#,##0.00"
+XL_INT, XL_DATE, XL_RATIO = "#,##0", "yyyy-mm-dd", "0.00"
+
+def _xl_clean(v):
+    """Convert numpy / pandas values into something openpyxl can write."""
+    if isinstance(v, pd.Timestamp):
+        return v.to_pydatetime()
+    if isinstance(v, (np.integer, np.floating, np.bool_)):
+        v = v.item()
+    if isinstance(v, float) and not np.isfinite(v):
+        return None
+    return v
+
+def _xl_block(ws, row, headers, rows, fmts=None, title=None, bold_last=False):
+    """Write a styled table at `row`; returns the next free row (with a gap)."""
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1E3A5F")
+    band_fill = PatternFill("solid", fgColor="F1F5F9")
+    thin      = Side(style="thin", color="CBD5E1")
+
+    if title:
+        ws.cell(row, 1, title).font = Font(bold=True, size=12, color="0EA5E9")
+        row += 1
+    for j, h in enumerate(headers, 1):
+        c = ws.cell(row, j, h)
+        c.font, c.fill = head_font, head_fill
+        c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for i, r in enumerate(rows):
+        row += 1
+        for j, v in enumerate(r, 1):
+            c = ws.cell(row, j, _xl_clean(v))
+            if fmts and fmts[j - 1]:
+                c.number_format = fmts[j - 1]
+            if i % 2:
+                c.fill = band_fill
+            if bold_last and i == len(rows) - 1:
+                c.font = Font(bold=True)
+                c.border = Border(top=thin)
+    return row + 2
+
+def _xl_kv(ws, row, title, items):
+    """Write a 2-column 'Metric | Value' section with a per-row number format."""
+    from openpyxl.styles import Font
+    ws.cell(row, 1, title).font = Font(bold=True, size=12, color="0EA5E9")
+    row += 1
+    for label, value, fmt in items:
+        ws.cell(row, 1, label).font = Font(color="475569")
+        c = ws.cell(row, 2, _xl_clean(value))
+        c.font = Font(bold=True)
+        if fmt:
+            c.number_format = fmt
+        row += 1
+    return row + 1
+
+def _xl_autofit(ws, min_w=10, max_w=48):
+    for col in ws.columns:
+        width = min_w
+        for c in list(col)[:300]:
+            if c.value is None:
+                continue
+            n = 12 if isinstance(c.value, (int, float)) else len(str(c.value))
+            width = max(width, min(max_w, n + 2))
+        ws.column_dimensions[col[0].column_letter].width = width
+
+def export_to_excel(path, r, td=252):
+    """Write the portfolio weights and every indicator to an .xlsx, one tab per topic."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.formatting.rule import ColorScaleRule
+    except ImportError:
+        raise RuntimeError("Excel export needs openpyxl:  pip install openpyxl")
+
+    names, df_close, port = r["names"], r["df_close"], r["portfolio"]
+    conf = r["conf"]
+    conf_lbl = f"{conf:.0%}"
+
+    rets = df_close.pct_change().dropna()
+    mu, cov = rets.mean().values, rets.cov().values
+    qty = np.asarray(r["quantities"], dtype=float)
+    p0, p1 = df_close.iloc[0].values, df_close.iloc[-1].values
+    invested, current = qty * p0, qty * p1
+    w_target = np.asarray(r["amounts"], dtype=float)
+    w_target = w_target / w_target.sum()
+    w_actual = invested / invested.sum() if invested.sum() > 0 else w_target
+
+    port_rets = port.pct_change().dropna()
+    drawdown  = port / port.cummax() - 1
+    var_d     = float(np.percentile(port_rets, (1 - conf) * 100))
+    cvar_d    = float(port_rets[port_rets <= var_d].mean())
+    ann_ret   = float(port_rets.mean() * td)
+    ann_vol   = float(port_rets.std() * np.sqrt(td))
+
+    # Indicator time series
+    ind = pd.DataFrame({"Portfolio Value (€)": port,
+                        "Daily Return": port.pct_change(),
+                        "Cumulative Return": port / port.iloc[0] - 1,
+                        "Drawdown": drawdown})
+    for p in r["sma_periods"]:
+        ind[f"SMA {p}"] = calc_sma(port, p)
+    ind[f"EMA {r['ema_period']}"] = calc_ema(port, r["ema_period"])
+    rsi = pd.Series(calc_rsi(port), index=port.index, dtype=float)
+    rsi.iloc[:14] = np.nan                       # warm-up period, not a real value
+    ind["RSI 14"] = rsi
+    ind["Rolling Vol 21d (ann.)"] = port.pct_change().rolling(21).std() * np.sqrt(td)
+
+    wb = Workbook()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    ws = wb.active
+    ws.title = "Summary"
+    ws.cell(1, 1, "Portfolio Report").font = Font(bold=True, size=16)
+    row = 3
+    row = _xl_kv(ws, row, "PARAMETERS", [
+        ("Source file",           os.path.basename(r["source"]),        None),
+        ("Export date",           pd.Timestamp.now().to_pydatetime(),   "yyyy-mm-dd hh:mm"),
+        ("First date",            port.index[0],                        XL_DATE),
+        ("Last date",             port.index[-1],                       XL_DATE),
+        ("Trading days",          len(port),                            XL_INT),
+        ("Number of assets",      len(names),                           XL_INT),
+        ("Allocation method",     r["method"],                          None),
+        ("Budget",                r["total"],                           XL_EUR),
+        ("Invested (whole shares)", invested.sum(),                     XL_EUR),
+        ("Cash left",             r["total"] - invested.sum(),          XL_EUR),
+        ("VaR confidence",        conf,                                 "0%"),
+    ])
+    row = _xl_kv(ws, row, "HISTORICAL PERFORMANCE", [
+        ("Start value",             port.iloc[0],                XL_EUR),
+        ("End value",               port.iloc[-1],               XL_EUR),
+        ("Total return",            port.iloc[-1] / port.iloc[0] - 1, XL_PCT),
+        ("Annualised return",       ann_ret,                     XL_PCT),
+        ("Annualised volatility",   ann_vol,                     XL_PCT),
+        ("Sharpe ratio (rf = 0)",   ann_ret / ann_vol if ann_vol else 0, XL_RATIO),
+        ("Max drawdown",            drawdown.min(),              XL_PCT),
+        (f"VaR {conf_lbl} (1 day)", var_d,                       XL_PCT),
+        (f"VaR {conf_lbl} (1 day, €)", var_d * port.iloc[-1],    XL_EUR),
+        (f"CVaR {conf_lbl} (1 day)", cvar_d,                     XL_PCT),
+        ("Best day",                port_rets.max(),             XL_PCT),
+        ("Worst day",               port_rets.min(),             XL_PCT),
+        ("% positive days",         (port_rets > 0).mean(),      XL_PCT),
+    ])
+    last = ind.iloc[-1]
+    row = _xl_kv(ws, row, "LATEST INDICATORS", [
+        (col, last[col], XL_EUR if col.startswith(("SMA", "EMA", "Portfolio")) else
+                         XL_RATIO if col == "RSI 14" else XL_PCT)
+        for col in ind.columns if col != "Daily Return"])
+
+    n_days = r["dash_days"]
+    m = dashboard_metrics(mu, cov, w_target, n_days, conf, port_rets, td)
+    row = _xl_kv(ws, row, f"DASHBOARD  (horizon {n_days} trading days)", [
+        ("Est. performance",        m["est_perf"],               XL_PCT),
+        ("Est. performance (€)",    m["est_perf"] * r["total"],  XL_EUR),
+        ("Est. volatility (ann.)",  m["est_vol"],                XL_PCT),
+        ("Current volatility (21d)", m["cur_vol"],               XL_PCT),
+        (f"VaR {conf_lbl} (horizon)", abs(m["var_horizon"]),     XL_PCT),
+        ("Sharpe ratio",            m["sharpe"],                 XL_RATIO),
+        ("Risk score (0-10)",       m["risk_score"],             "0.0"),
+        ("Risk level",              m["risk_label"],             None),
+    ])
+    if r.get("ucits"):
+        u = r["ucits"]
+        _xl_kv(ws, row, "UCITS 5/10/40", [
+            ("Compliant",               "YES" if u["ok"] else "NO", None),
+            ("Largest position",        u["max_w"],                 XL_PCT),
+            ("Sum of positions > 5%",   u["big_sum"],               XL_PCT),
+        ])
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 26
+
+    # ── Weights ───────────────────────────────────────────────────────────────
+    ws = wb.create_sheet("Weights")
+    order = np.argsort(w_actual)[::-1]
+    rows = [(names[i], w_target[i], w_target[i] * r["total"], p0[i], int(qty[i]),
+             invested[i], w_actual[i], p1[i], current[i],
+             current[i] / current.sum() if current.sum() else 0,
+             current[i] - invested[i],
+             current[i] / invested[i] - 1 if invested[i] else None)
+            for i in order]
+    rows.append(("TOTAL", w_target.sum(), r["total"], None, int(qty.sum()),
+                 invested.sum(), w_actual.sum(), None, current.sum(), 1.0,
+                 current.sum() - invested.sum(),
+                 current.sum() / invested.sum() - 1 if invested.sum() else None))
+    _xl_block(ws, 1,
+              ["Asset", "Target Weight", "Target Amount (€)", "Start Price", "Quantity",
+               "Invested (€)", "Actual Weight", "Last Price", "Current Value (€)",
+               "Current Weight", "P&L (€)", "P&L (%)"],
+              rows,
+              [None, XL_PCT, XL_EUR, XL_NUM, XL_INT, XL_EUR, XL_PCT, XL_NUM,
+               XL_EUR, XL_PCT, XL_EUR, XL_PCT], bold_last=True)
+    ws.freeze_panes = "B2"
+    _xl_autofit(ws)
+
+    # ── Indicators (daily time series) ────────────────────────────────────────
+    ws = wb.create_sheet("Indicators")
+    fmts = [XL_DATE] + [XL_EUR if c.startswith(("SMA", "EMA", "Portfolio")) else
+                        XL_RATIO if c == "RSI 14" else XL_PCT for c in ind.columns]
+    _xl_block(ws, 1, ["Date", *ind.columns],
+              [(d, *vals) for d, vals in zip(ind.index, ind.itertuples(index=False))], fmts)
+    ws.freeze_panes = "B2"
+    _xl_autofit(ws)
+
+    # ── Asset statistics ──────────────────────────────────────────────────────
+    ws = wb.create_sheet("Asset Stats")
+    sig_p = float(np.sqrt(w_actual @ cov @ w_actual))
+    risk_contrib = w_actual * (cov @ w_actual) / sig_p**2 if sig_p > 0 else np.zeros(len(names))
+    asset_dd = (df_close / df_close.cummax() - 1).min().values
+    rows = []
+    for i, n in enumerate(names):
+        a = rets.iloc[:, i]
+        a_var = float(np.percentile(a, (1 - conf) * 100))
+        a_ret, a_vol = mu[i] * td, a.std() * np.sqrt(td)
+        rows.append((n, w_actual[i], p1[i] / p0[i] - 1, a_ret, a_vol,
+                     a_ret / a_vol if a_vol else 0, a_var, a[a <= a_var].mean(),
+                     asset_dd[i], risk_contrib[i]))
+    _xl_block(ws, 1,
+              ["Asset", "Weight", "Total Return", "Ann. Return", "Ann. Volatility",
+               "Sharpe", f"VaR {conf_lbl} (1d)", f"CVaR {conf_lbl} (1d)",
+               "Max Drawdown", "Risk Contribution"],
+              rows, [None, XL_PCT, XL_PCT, XL_PCT, XL_PCT, XL_RATIO,
+                     XL_PCT, XL_PCT, XL_PCT, XL_PCT])
+    ws.freeze_panes = "B2"
+    _xl_autofit(ws)
+
+    # ── Correlation matrix ────────────────────────────────────────────────────
+    ws = wb.create_sheet("Correlation")
+    corr = rets.corr().values
+    _xl_block(ws, 1, ["", *names],
+              [(names[i], *corr[i]) for i in range(len(names))],
+              [None] + [XL_RATIO] * len(names))
+    last_cell = ws.cell(len(names) + 1, len(names) + 1).coordinate
+    ws.conditional_formatting.add(f"B2:{last_cell}", ColorScaleRule(
+        start_type="num", start_value=-1, start_color="EF4444",
+        mid_type="num", mid_value=0, mid_color="FFFFFF",
+        end_type="num", end_value=1, end_color="0EA5E9"))
+    ws.freeze_panes = "B2"
+    _xl_autofit(ws, min_w=9)
+
+    # ── Efficient frontier ────────────────────────────────────────────────────
+    ws = wb.create_sheet("Efficient Frontier")
+    w_ms, w_mv = max_sharpe(mu, cov, len(mu)), min_variance(mu, cov, len(mu))
+    ports = [("Your Portfolio", w_actual), ("Max Sharpe", w_ms), ("Min Variance", w_mv)]
+    row = _xl_block(ws, 1, ["Portfolio", "Ann. Return", "Ann. Volatility", "Sharpe"],
+                    [(lbl, *portfolio_perf(w, mu, cov, td)) for lbl, w in ports],
+                    [None, XL_PCT, XL_PCT, XL_RATIO], title="KEY PORTFOLIOS")
+    row = _xl_block(ws, row, ["Asset", *[lbl for lbl, _ in ports]],
+                    [(names[i], *[w[i] for _, w in ports]) for i in order],
+                    [None, XL_PCT, XL_PCT, XL_PCT], title="WEIGHTS COMPARISON")
+    if r.get("frontier") is not None:
+        fr_v, fr_r = r["frontier"]
+        _xl_block(ws, row, ["Ann. Volatility", "Ann. Return", "Sharpe"],
+                  [(v, ret, ret / v if v else 0) for v, ret in zip(fr_v, fr_r)],
+                  [XL_PCT, XL_PCT, XL_RATIO], title="FRONTIER CURVE")
+    _xl_autofit(ws)
+
+    # ── GBM Monte Carlo ───────────────────────────────────────────────────────
+    if r.get("gbm") is not None:
+        g  = r["gbm"]
+        ws = wb.create_sheet("GBM Projection")
+        pct = g["percentiles"]
+        row = _xl_kv(ws, 1, f"FINAL VALUE AFTER {len(pct) - 1} DAYS  "
+                            f"({g['n_sims']} simulations)",
+                     [(c, pct[c].iloc[-1], XL_EUR) for c in pct.columns])
+        if g.get("shocks"):
+            row = _xl_block(ws, row,
+                            ["Scenario", "Description", "Trough (median)", "Trough Day",
+                             "Final Median (€)", "Final 5th pct (€)"],
+                            g["shocks"], [None, None, XL_PCT, XL_INT, XL_EUR, XL_EUR],
+                            title="SHOCK SCENARIOS")
+        _xl_block(ws, row, ["Day", *pct.columns],
+                  [(d, *vals) for d, vals in zip(pct.index, pct.itertuples(index=False))],
+                  [XL_INT] + [XL_EUR] * len(pct.columns), title="PERCENTILE PATHS")
+        _xl_autofit(ws)
+        ws.column_dimensions["A"].width = 26
+
+    wb.save(path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -365,6 +713,7 @@ class App:
         self.v_dashboard  = tk.BooleanVar(value=True)
         self.v_dash_range = tk.StringVar(value="63")   # trading days (≈3 months)
         self.v_ucits      = tk.BooleanVar(value=False)
+        self._results     = None   # everything the Excel export needs, set by _pipeline
 
         # ── Build layout ──────────────────────────────────────────────────────
         self._build_sidebar()
@@ -603,6 +952,12 @@ class App:
             padx=24, pady=10, cursor="hand2", command=self._run)
         self._run_btn.pack(side="left")
 
+        self._export_btn = tk.Button(
+            run_row, text="📥  Export to Excel", font=("Courier New",11,"bold"),
+            fg=C["bg"], bg=C["accent"], relief="flat", state="disabled",
+            padx=24, pady=10, cursor="hand2", command=self._export_excel)
+        self._export_btn.pack(side="left", padx=(12,0))
+
         self._pbar = ttk.Progressbar(run_row, mode="indeterminate", length=300)
         style = ttk.Style(); style.theme_use("clam")
         style.configure("TProgressbar", troughcolor=C["muted"],
@@ -662,6 +1017,8 @@ class App:
             messagebox.showerror("Invalid amount", "Investment must be a number."); return
 
         self._run_btn.config(state="disabled")
+        self._export_btn.config(state="disabled")
+        self._results = None
         self._pbar.pack(side="left", padx=12)
         self._pbar.start(10)
         self._set_status("Loading…")
@@ -704,6 +1061,8 @@ class App:
             prices0     = df_close.iloc[0].values
             quantities  = [int(a / p) if p > 0 else 0
                            for a, p in zip(amounts, prices0)]
+            if self.v_ucits.get() and self.v_optimize.get() and not self.v_uniform.get():
+                quantities = ucits_whole_shares(prices0, amounts, total)
             portfolio_close = (df_close * quantities).sum(axis=1)
             portfolio_close.name = "Portfolio"
             df_portfolio = pd.DataFrame({"Portfolio": portfolio_close})
@@ -718,10 +1077,11 @@ class App:
 
             # UCITS compliance check on the amounts actually invested
             # (whole-share rounding can shift weights slightly)
-            ucits_note = None
+            ucits_note = ucits_info = None
             if self.v_ucits.get():
                 ok, max_w, big_sum = ucits_check(df_distrib["Amount (€)"].values)
                 ucits_note = "UCITS ✔" if ok else "UCITS ✗"
+                ucits_info = {"ok": ok, "max_w": max_w, "big_sum": big_sum}
                 if not ok:
                     msg = (f"Portfolio is NOT UCITS 5/10/40 compliant.\n\n"
                            f"Largest position: {max_w:.2%}  (limit 10%)\n"
@@ -731,18 +1091,36 @@ class App:
             # 4. Render charts
             self._set_status("Rendering charts…")
             conf = float(self.v_conf.get())
+            periods_sma = [int(x.strip()) for x in self.v_sma_p.get().split(",")
+                            if x.strip().isdigit()]
+            raw_ema = self.v_ema_p.get().strip()
+            period_ema = int(raw_ema) if raw_ema.isdigit() else 12
+
+            # Keep everything the Excel export needs
+            if self.v_uniform.get():    method = "Uniform split"
+            elif self.v_optimize.get(): method = "Markowitz (max Sharpe)" + (
+                                            " + UCITS 5/10/40" if self.v_ucits.get() else "")
+            else:                       method = "Custom amounts"
+            df_close_dt = df_close.copy()
+            df_close_dt.index = df_portfolio.index
+            df_close_dt.columns = names
+            self._results = {
+                "source": self.v_path.get(), "total": total, "method": method,
+                "conf": conf, "names": names, "df_close": df_close_dt,
+                "portfolio": df_portfolio["Portfolio"], "amounts": amounts,
+                "quantities": quantities, "sma_periods": periods_sma,
+                "ema_period": period_ema, "ucits": ucits_info,
+                "dash_days": int(self.v_dash_range.get())
+                             if self.v_dash_range.get().isdigit() else 63,
+            }
 
             if self.v_var.get():
                 self.root.after(0, lambda: self._plot_var(df_portfolio, conf))
 
             if self.v_sma.get():
-                periods_sma = [int(x.strip()) for x in self.v_sma_p.get().split(",")
-                                if x.strip().isdigit()]
                 self.root.after(0, lambda p=periods_sma: self._plot_sma(df_portfolio, p))
 
             if self.v_ema.get():
-                raw_ema = self.v_ema_p.get().strip()
-                period_ema = int(raw_ema) if raw_ema.isdigit() else 12
                 self.root.after(0, lambda p=period_ema: self._plot_ema(df_portfolio, p))
 
             if self.v_rsi.get():
@@ -761,6 +1139,7 @@ class App:
                 cov     = ret_df.cov().values
                 mc_r, mc_v, mc_s = self._monte_carlo(mu, cov, n_assets)
                 fr_v, fr_r       = self._frontier_curve(mu, cov, n_assets)
+                self._results["frontier"] = (fr_v, fr_r)
                 self.root.after(0, lambda: self._plot_frontier(
                     mc_r, mc_v, mc_s, fr_v, fr_r, w_arr, mu, cov, names))
 
@@ -825,6 +1204,7 @@ class App:
         self._pbar.stop()
         self._pbar.pack_forget()
         self._run_btn.config(state="normal")
+        self._export_btn.config(state="normal")
         self._set_status("✔ Analysis complete" + (f"  ·  {ucits_note}" if ucits_note else ""))
         # Auto-navigate to first enabled chart
         for key in ["dashboard","var","sma","ema","rsi","distrib","frontier","gbm"]:
@@ -839,6 +1219,30 @@ class App:
         self._run_btn.config(state="normal")
         self._set_status(f"✗ Error")
         messagebox.showerror("Error", msg)
+
+    def _export_excel(self):
+        if not self._results:
+            messagebox.showinfo("Nothing to export", "Run the analysis first."); return
+        stem = os.path.splitext(os.path.basename(self._results["source"]))[0]
+        path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx", filetypes=[("Excel workbook", "*.xlsx")],
+            initialfile=f"portfolio_{stem}_{pd.Timestamp.now():%Y%m%d}.xlsx")
+        if not path:
+            return
+        self._set_status("Exporting to Excel…")
+        try:
+            export_to_excel(path, self._results)
+        except PermissionError:
+            messagebox.showerror("Export failed",
+                                 "Cannot write the file — is it open in Excel?")
+            self._set_status("✗ Export failed"); return
+        except Exception as ex:
+            messagebox.showerror("Export failed", str(ex))
+            self._set_status("✗ Export failed"); return
+        self._set_status("✔ Exported to Excel")
+        if hasattr(os, "startfile") and messagebox.askyesno(
+                "Export complete", f"Saved to:\n{path}\n\nOpen it now?"):
+            os.startfile(path)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  CHART BUILDERS
@@ -1086,6 +1490,12 @@ class App:
         pct_50   = np.percentile(paths, 50, axis=0)
         pct_75   = np.percentile(paths, 75, axis=0)
         pct_95   = np.percentile(paths, 95, axis=0)
+        gbm_export = {"n_sims": n_sims, "shocks": [], "percentiles": pd.DataFrame(
+            {"5th pct": pct_5, "25th pct": pct_25, "Median": pct_50,
+             "75th pct": pct_75, "95th pct": pct_95},
+            index=pd.Index(days_arr, name="Day"))}
+        if self._results is not None:
+            self._results["gbm"] = gbm_export
 
         # ── Shock scenarios (approximate GBM with shocked drift/vol) ──────────
         SHOCKS = [
@@ -1277,6 +1687,8 @@ class App:
                             color=shock["color"], s=30, zorder=6)
 
                 drop_pct = (sp50[trough_idx] / initial_val - 1) * 100
+                gbm_export["shocks"].append((shock["name"], shock["desc"], drop_pct / 100,
+                                             int(trough_idx), sp50[-1], sp5[-1]))
                 sax.yaxis.set_major_formatter(FuncFormatter(lambda x,_: f"€{x/1e3:.0f}k"))
                 sax.set_title(shock["name"], fontsize=7.5, fontweight="semibold",
                               color=shock["color"])
@@ -1371,44 +1783,14 @@ class App:
     def _build_dashboard_data(self, mu, cov, weights, n_days, initial_val,
                                conf, port_rets, names, df_close):
         """Compute all dashboard metrics and render the panel."""
-        TD = 252  # trading days per year
-
-        # ── 1. Returns & covariance ───────────────────────────────────────────
-        port_mu_d  = float(np.dot(weights, mu))           # daily drift
-        port_var_d = float(weights @ cov @ weights)        # daily variance
-        port_sig_d = float(np.sqrt(port_var_d))           # daily vol
-
-        # ── 2. Annualised current vol (realised, last 21 days) ────────────────
-        recent = port_rets.iloc[-21:] if len(port_rets) >= 21 else port_rets
-        cur_vol_ann = float(recent.std() * np.sqrt(TD))
-
-        # ── 3. Estimated vol over horizon (annualised) ────────────────────────
-        est_vol_ann = port_sig_d * np.sqrt(TD)
-
-        # ── 4. Estimated performance over horizon (GBM expected) ─────────────
-        # E[S_T] = S_0 * exp(mu * T)  — use log-normal mean
-        est_perf_pct = float(np.exp(port_mu_d * n_days) - 1)
+        # ── 1-7. Metrics (shared with the Excel export) ───────────────────────
+        m = dashboard_metrics(mu, cov, weights, n_days, conf, port_rets)
+        est_perf_pct, est_vol_ann, cur_vol_ann = m["est_perf"], m["est_vol"], m["cur_vol"]
+        var_horiz, sharpe_ann = m["var_horizon"], m["sharpe"]
+        risk_score, risk_label = m["risk_score"], m["risk_label"]
         est_perf_eur = initial_val * est_perf_pct
-
-        # ── 5. VaR over horizon ───────────────────────────────────────────────
-        var_daily  = float(np.percentile(port_rets.dropna(), (1 - conf) * 100))
-        var_horiz  = var_daily * np.sqrt(n_days)   # square-root scaling
-        var_eur    = initial_val * abs(var_horiz)
-
-        # ── 6. Sharpe (annualised, rf=0) ──────────────────────────────────────
-        sharpe_ann = (port_mu_d * TD) / (port_sig_d * np.sqrt(TD)) if port_sig_d > 0 else 0.0
-
-        # ── 7. Risk indicator (0-10 composite) ───────────────────────────────
-        #   Components: annualised vol, VaR severity, abs(Sharpe) inverse
-        vol_score  = min(10, (est_vol_ann / 0.40) * 10)       # 40% vol → score 10
-        var_score  = min(10, (abs(var_horiz) / 0.30) * 10)    # 30% horizon VaR → 10
-        shrp_score = max(0, 10 - abs(sharpe_ann) * 2)          # high Sharpe lowers risk score
-        risk_score = round((vol_score * 0.45 + var_score * 0.35 + shrp_score * 0.20), 1)
-        risk_score = min(10, max(0, risk_score))
-
-        if   risk_score <= 3:  risk_label, risk_color = "LOW",    C["pos"]
-        elif risk_score <= 6:  risk_label, risk_color = "MEDIUM", C["accent3"]
-        else:                  risk_label, risk_color = "HIGH",   C["danger"]
+        var_eur      = initial_val * abs(var_horiz)
+        risk_color   = {"LOW": C["pos"], "MEDIUM": C["accent3"], "HIGH": C["danger"]}[risk_label]
 
         # ── 8. Update range label ─────────────────────────────────────────────
         months_approx = round(n_days / 21, 1)
@@ -1587,8 +1969,8 @@ class App:
                  fontsize=9, fontweight="bold", color=MP["text"],
                  transform=ax4.transAxes)
         y -= 0.10
-        ax4.axhline(y, xmin=0.05, xmax=0.95, color=MP["border"],
-                    lw=0.8, transform=ax4.transAxes)
+        ax4.plot([0.05, 0.95], [y, y], color=MP["border"],
+                 lw=0.8, transform=ax4.transAxes)
         y -= 0.04
 
         for label, value, color in metrics:
@@ -1598,8 +1980,8 @@ class App:
                      fontsize=8, fontweight="bold", color=color,
                      transform=ax4.transAxes)
             y -= 0.115
-            ax4.axhline(y + 0.04, xmin=0.05, xmax=0.95,
-                        color=MP["grid"], lw=0.4, transform=ax4.transAxes)
+            ax4.plot([0.05, 0.95], [y + 0.04, y + 0.04],
+                     color=MP["grid"], lw=0.4, transform=ax4.transAxes)
 
         # Risk gauge bar inside the scorecard
         ax4.text(0.05, y - 0.02, "Risk Gauge", ha="left", va="top",
