@@ -139,6 +139,91 @@ def download_cac40(path, period="1y"):
     df.to_csv(path, date_format="%Y-%m-%d")
     return kept, skipped
 
+# ── Benchmark (CAC 40 index) ─────────────────────────────────────────────────
+BENCHMARK_TICKER = "^FCHI"
+BENCHMARK_NAME   = "CAC 40"
+
+def download_benchmark(start, end, ticker=BENCHMARK_TICKER):
+    """Daily closes of the benchmark index between two dates (inclusive)."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise RuntimeError("Benchmark download needs yfinance:  pip install yfinance")
+    raw = yf.download(ticker, start=pd.Timestamp(start),
+                      end=pd.Timestamp(end) + pd.Timedelta(days=1),
+                      interval="1d", auto_adjust=True, progress=False)
+    if raw is None or raw.empty:
+        raise RuntimeError(f"Yahoo Finance returned no data for {ticker}.")
+    close = raw["Close"]
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    close.index = pd.to_datetime(close.index).tz_localize(None).normalize()
+    return close.dropna().rename(BENCHMARK_NAME)
+
+def benchmark_analysis(port, bench, rf=0.0, td=252):
+    """
+    Portfolio vs benchmark, CAPM style. `rf` is the annual risk-free rate.
+      Sharpe  = (Rp − rf) / σp
+      Beta    = cov(rp, rm) / var(rm)
+      Alpha   = Rp − [rf + β (Rm − rf)]        (Jensen)
+      Treynor = (Rp − rf) / β
+      M²      = rf + Sharpe_p · σm              (Modigliani: return at benchmark risk)
+      TE      = σ(rp − rm),  IR = (Rp − Rm) / TE
+    Returns annualised figures, a comparison table and the aligned daily series.
+    """
+    df = pd.concat([port.rename("Portfolio"), bench.rename(BENCHMARK_NAME)],
+                   axis=1, join="inner").dropna()
+    if len(df) < 30:
+        raise ValueError("Fewer than 30 common dates between portfolio and benchmark.")
+    rets = df.pct_change().dropna()
+    rp, rm = rets["Portfolio"], rets[BENCHMARK_NAME]
+
+    R_p, R_m = rp.mean() * td, rm.mean() * td
+    s_p, s_m = rp.std() * np.sqrt(td), rm.std() * np.sqrt(td)
+    beta     = rp.cov(rm) / rm.var()
+    corr     = rp.corr(rm)
+    sharpe_p = (R_p - rf) / s_p if s_p else np.nan
+    sharpe_m = (R_m - rf) / s_m if s_m else np.nan
+    alpha    = R_p - (rf + beta * (R_m - rf))
+    treynor  = (R_p - rf) / beta if abs(beta) > 1e-8 else np.nan
+    m2       = rf + sharpe_p * s_m
+    te       = (rp - rm).std() * np.sqrt(td)
+    ir       = (R_p - R_m) / te if te else np.nan
+    tot_p, tot_m = df.iloc[-1] / df.iloc[0] - 1
+    mdd_p, mdd_m = (df / df.cummax() - 1).min()
+
+    # (label, portfolio, benchmark, format) — difference = portfolio − benchmark
+    rows = [
+        ("Total return",          tot_p,    tot_m,    "pct"),
+        ("Annualised return",     R_p,      R_m,      "pct"),
+        ("Annualised volatility", s_p,      s_m,      "pct"),
+        ("Sharpe ratio",          sharpe_p, sharpe_m, "ratio"),
+        ("Jensen's alpha",        alpha,    0.0,      "pct"),
+        ("Treynor ratio",         treynor,  R_m - rf, "pct"),
+        ("M² (Modigliani)",       m2,       R_m,      "pct"),
+        ("Beta",                  beta,     1.0,      "ratio"),
+        ("Correlation",           corr,     1.0,      "ratio"),
+        ("R²",                    corr**2,  1.0,      "ratio"),
+        ("Tracking error",        te,       0.0,      "pct"),
+        ("Information ratio",     ir,       np.nan,   "ratio"),
+        ("Max drawdown",          mdd_p,    mdd_m,    "pct"),
+    ]
+
+    base = df / df.iloc[0] * 100
+    series = pd.DataFrame({
+        "Portfolio (€)":             df["Portfolio"],
+        f"{BENCHMARK_NAME} (pts)":   df[BENCHMARK_NAME],
+        "Portfolio (base 100)":      base["Portfolio"],
+        f"{BENCHMARK_NAME} (base 100)": base[BENCHMARK_NAME],
+        "Relative performance":      base["Portfolio"] / base[BENCHMARK_NAME] - 1,
+        "Portfolio return":          df["Portfolio"].pct_change(),
+        f"{BENCHMARK_NAME} return":  df[BENCHMARK_NAME].pct_change(),
+        "Excess return":             df["Portfolio"].pct_change() - df[BENCHMARK_NAME].pct_change(),
+        "Rolling beta 63d":          rp.rolling(63).cov(rm) / rm.rolling(63).var(),
+    })
+    return {"rows": rows, "series": series, "rf": rf, "beta": beta, "alpha": alpha,
+            "rp": rp, "rm": rm, "outperf": tot_p - tot_m}
+
 def portfolio_perf(w, mu, cov, td=252):
     r = np.dot(w, mu) * td
     v = np.sqrt(w @ cov @ w) * np.sqrt(td)
@@ -522,11 +607,17 @@ def export_to_excel(path, r, td=252):
     ])
     if r.get("ucits"):
         u = r["ucits"]
-        _xl_kv(ws, row, "UCITS 5/10/40", [
+        row = _xl_kv(ws, row, "UCITS 5/10/40", [
             ("Compliant",               "YES" if u["ok"] else "NO", None),
             ("Largest position",        u["max_w"],                 XL_PCT),
             ("Sum of positions > 5%",   u["big_sum"],               XL_PCT),
         ])
+    bench = r.get("bench")
+    if bench:
+        fmt = {"pct": XL_PCT, "ratio": XL_RATIO}
+        _xl_kv(ws, row, f"VS {BENCHMARK_NAME.upper()}  (rf = {bench['rf']:.2%})",
+               [(lbl, p, fmt[k]) for lbl, p, _, k in bench["rows"]] +
+               [(f"Out/under-performance vs {BENCHMARK_NAME}", bench["outperf"], XL_PCT)])
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 26
 
@@ -583,6 +674,42 @@ def export_to_excel(path, r, td=252):
                      XL_PCT, XL_PCT, XL_PCT, XL_PCT])
     ws.freeze_panes = "B2"
     _xl_autofit(ws)
+
+    # ── Benchmark comparison ──────────────────────────────────────────────────
+    if bench:
+        from openpyxl.chart import LineChart, Reference
+        ws = wb.create_sheet("Benchmark")
+        fmt = {"pct": XL_PCT, "ratio": XL_RATIO}
+        top = 2   # first data row of the comparison table (title on row 1)
+        row = _xl_block(ws, 1, ["Metric", "Portfolio", BENCHMARK_NAME, "Difference"],
+                        [(lbl, p, b, p - b if np.isfinite(p) and np.isfinite(b) else None)
+                         for lbl, p, b, _ in bench["rows"]],
+                        title=f"PORTFOLIO VS {BENCHMARK_NAME.upper()}  "
+                              f"(risk-free rate {bench['rf']:.2%})")
+        for i, (_, _, _, k) in enumerate(bench["rows"]):
+            for col in (2, 3, 4):
+                ws.cell(top + 1 + i, col).number_format = fmt[k]
+
+        s = bench["series"]
+        s_fmts = [XL_DATE, XL_EUR, XL_NUM, XL_NUM, XL_NUM, XL_PCT,
+                  XL_PCT, XL_PCT, XL_PCT, XL_RATIO]
+        first = row + 1   # header row of the time series (title on `row`)
+        _xl_block(ws, row, ["Date", *s.columns],
+                  [(d, *vals) for d, vals in zip(s.index, s.itertuples(index=False))],
+                  s_fmts, title="DAILY SERIES")
+
+        chart = LineChart()
+        chart.title = f"Portfolio vs {BENCHMARK_NAME} (base 100)"
+        chart.y_axis.title, chart.x_axis.title = "Base 100", "Date"
+        chart.x_axis.number_format = "mmm yy"
+        chart.height, chart.width = 9, 22
+        chart.add_data(Reference(ws, min_col=4, max_col=5, min_row=first,
+                                 max_row=first + len(s)), titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=1, min_row=first + 1,
+                                       max_row=first + len(s)))
+        ws.add_chart(chart, "L2")   # right of the 10 data columns
+        _xl_autofit(ws)
+        ws.column_dimensions["A"].width = 24
 
     # ── Correlation matrix ────────────────────────────────────────────────────
     ws = wb.create_sheet("Correlation")
@@ -758,7 +885,9 @@ class App:
         self.v_dashboard  = tk.BooleanVar(value=True)
         self.v_dash_range = tk.StringVar(value="63")   # trading days (≈3 months)
         self.v_ucits      = tk.BooleanVar(value=False)
-        self._results     = None   # everything the Excel export needs, set by _pipeline
+        self.v_bench      = tk.BooleanVar(value=True)
+        self.v_rf         = tk.StringVar(value="0.0")  # annual risk-free rate, %
+        self._results    = None   # everything the Excel export needs, set by _pipeline
 
         # ── Build layout ──────────────────────────────────────────────────────
         self._build_sidebar()
@@ -795,6 +924,7 @@ class App:
             ("distrib",  "🗂  Distribution"),
             ("frontier", "🌐  Efficient Frontier"),
             ("gbm",      "🎲  GBM Monte Carlo"),
+            ("bench",    "⚖  vs CAC 40"),
             ("dashboard","🏠  Dashboard"),
         ]
         for key, label in nav_items:
@@ -846,6 +976,7 @@ class App:
             "distrib":  self._build_chart_panel("distrib"),
             "frontier": self._build_chart_panel("frontier"),
             "gbm":      self._build_chart_panel("gbm"),
+            "bench":    self._build_chart_panel("bench"),
             "dashboard": self._build_dashboard_panel(),
         }
 
@@ -959,6 +1090,13 @@ class App:
         ef_dr, _ = _entry(r4, self.v_dash_range, width=6); ef_dr.pack(side="left", padx=6)
         _lbl(r4, "  e.g. 21=1M  63=3M  126=6M  252=1Y", fg=C["sub"], bg=C["card"],
              font=FS).pack(side="left")
+
+        r5 = tk.Frame(sec4, bg=C["card"]); r5.pack(anchor="w", pady=(8,0))
+        Toggle(r5, "Benchmark vs CAC 40", self.v_bench).pack(side="left", padx=(0,16))
+        _lbl(r5, "Risk-free rate (% / year):", fg=C["sub"], bg=C["card"]).pack(side="left")
+        ef_rf, _ = _entry(r5, self.v_rf, width=6); ef_rf.pack(side="left", padx=6)
+        _lbl(r5, "  Sharpe · Alpha · Treynor · M²  (index from Yahoo Finance)",
+             fg=C["sub"], bg=C["card"], font=FS).pack(side="left")
 
         # ── Section: Optimization constraints ────────────────────────────────
         sec5 = self._card(pad, "OPTIMIZATION CONSTRAINTS")
@@ -1251,6 +1389,22 @@ class App:
                     mu_dash, cov_dash, w_dash, n_days_d, init_d, conf_d,
                     port_rets, names, df_close))
 
+            if self.v_bench.get():
+                self._set_status(f"Downloading {BENCHMARK_NAME} benchmark…")
+                try:
+                    rf = float(self.v_rf.get().replace(",", ".")) / 100
+                except ValueError:
+                    rf = 0.0
+                port = df_portfolio["Portfolio"]
+                try:
+                    bench_px = download_benchmark(port.index[0], port.index[-1])
+                    bench = benchmark_analysis(port, bench_px, rf)
+                    self._results["bench"] = bench
+                    self.root.after(0, lambda b=bench: self._plot_bench(b))
+                except Exception as ex:
+                    self.root.after(0, lambda m=str(ex): messagebox.showwarning(
+                        "Benchmark", f"{BENCHMARK_NAME} comparison skipped:\n{m}"))
+
             self.root.after(0, lambda: self._done(ucits_note))
 
         except Exception as ex:
@@ -1286,10 +1440,10 @@ class App:
         self._export_btn.config(state="normal")
         self._set_status("✔ Analysis complete" + (f"  ·  {ucits_note}" if ucits_note else ""))
         # Auto-navigate to first enabled chart
-        for key in ["dashboard","var","sma","ema","rsi","distrib","frontier","gbm"]:
+        for key in ["dashboard","var","sma","ema","rsi","distrib","frontier","gbm","bench"]:
             v = {"var":self.v_var,"sma":self.v_sma,"ema":self.v_ema,
                  "rsi":self.v_rsi,"distrib":self.v_distrib,"frontier":self.v_frontier,
-                 "gbm":self.v_gbm_mc,"dashboard":self.v_dashboard}
+                 "gbm":self.v_gbm_mc,"dashboard":self.v_dashboard,"bench":self.v_bench}
             if v[key].get():
                 self._show_panel(key); break
 
@@ -1543,6 +1697,99 @@ class App:
 
 
     # ── GBM Monte Carlo ───────────────────────────────────────────────────────
+    # ── Benchmark comparison ──────────────────────────────────────────────────
+    def _plot_bench(self, b):
+        """Portfolio vs CAC 40: growth, relative performance, beta line, metrics."""
+        mpl_style()
+        s   = b["series"]
+        idx = s.index
+        p   = s["Portfolio (base 100)"]
+        m   = s[f"{BENCHMARK_NAME} (base 100)"]
+        rel = s["Relative performance"]
+
+        fig = plt.figure(figsize=(12, 7))
+        fig.patch.set_facecolor(MP["bg"])
+        gs = gridspec.GridSpec(2, 3, figure=fig, left=0.06, right=0.98, top=0.91,
+                               bottom=0.10, wspace=0.30, hspace=0.45,
+                               height_ratios=[1.4, 1])
+
+        # ── A: growth of 100 ─────────────────────────────────────────────────
+        ax1 = fig.add_subplot(gs[0, :2])
+        ax1.plot(idx, p, color=MP["accent"], lw=1.6, label=f"Portfolio  {p.iloc[-1]:.1f}")
+        ax1.plot(idx, m, color=MP["accent3"], lw=1.4,
+                 label=f"{BENCHMARK_NAME}  {m.iloc[-1]:.1f}")
+        ax1.fill_between(idx, p, m, where=(p >= m), color=MP["pos"],
+                         alpha=0.15, interpolate=True, label="Outperforming")
+        ax1.fill_between(idx, p, m, where=(p < m), color=MP["danger"],
+                         alpha=0.15, interpolate=True, label="Underperforming")
+        ax1.axhline(100, color=MP["sub"], lw=0.7, ls=":")
+        ax1.set_title(f"Growth of 100 — Portfolio vs {BENCHMARK_NAME}")
+        ax1.legend(loc="lower right")
+        _date_axis(ax1)
+        _tag(ax1, "BASE 100")
+
+        # ── B: relative performance ──────────────────────────────────────────
+        ax2 = fig.add_subplot(gs[1, :2])
+        ax2.fill_between(idx, rel, 0, where=(rel >= 0), color=MP["pos"],
+                         alpha=0.35, interpolate=True)
+        ax2.fill_between(idx, rel, 0, where=(rel < 0), color=MP["danger"],
+                         alpha=0.35, interpolate=True)
+        ax2.plot(idx, rel, color=MP["text"], lw=0.9)
+        ax2.axhline(0, color=MP["sub"], lw=0.8)
+        ax2.yaxis.set_major_formatter(FuncFormatter(lambda x, _: f"{x:+.0%}"))
+        ax2.set_title(f"Relative performance  (final {rel.iloc[-1]:+.2%})")
+        _date_axis(ax2)
+        _tag(ax2, "RELATIVE")
+
+        # ── C: security characteristic line (beta) ───────────────────────────
+        ax3 = fig.add_subplot(gs[0, 2])
+        rp, rm = b["rp"], b["rm"]
+        ax3.scatter(rm, rp, s=6, color=MP["accent"], alpha=0.45, edgecolors="none")
+        xs = np.linspace(rm.min(), rm.max(), 50)
+        ax3.plot(xs, rp.mean() + b["beta"] * (xs - rm.mean()), color=MP["accent3"],
+                 lw=1.6, label=f"β = {b['beta']:.2f}")
+        ax3.axhline(0, color=MP["sub"], lw=0.5); ax3.axvline(0, color=MP["sub"], lw=0.5)
+        fmt = FuncFormatter(lambda x, _: f"{x:.1%}")
+        ax3.xaxis.set_major_formatter(fmt); ax3.yaxis.set_major_formatter(fmt)
+        ax3.set_xlabel(f"{BENCHMARK_NAME} daily return")
+        ax3.set_ylabel("Portfolio daily return")
+        ax3.set_title("Daily returns & beta")
+        ax3.legend(loc="upper left")
+
+        # ── D: metrics table ─────────────────────────────────────────────────
+        ax4 = fig.add_subplot(gs[1, 2]); ax4.axis("off")
+        show = ["Annualised return", "Annualised volatility", "Sharpe ratio",
+                "Jensen's alpha", "Treynor ratio", "M² (Modigliani)", "Beta",
+                "Information ratio"]
+        def f(v, k):
+            if v is None or not np.isfinite(v): return "—"
+            return f"{v:+.2%}" if k == "pct" else f"{v:.2f}"
+        y = 1.0
+        ax4.text(0.00, y, "Metric", fontsize=7, color=MP["sub"], fontweight="bold",
+                 transform=ax4.transAxes)
+        ax4.text(0.62, y, "Portf.", fontsize=7, color=MP["accent"], fontweight="bold",
+                 ha="right", transform=ax4.transAxes)
+        ax4.text(0.98, y, BENCHMARK_NAME, fontsize=7, color=MP["accent3"],
+                 fontweight="bold", ha="right", transform=ax4.transAxes)
+        for lbl, pv, bv, k in b["rows"]:
+            if lbl not in show: continue
+            y -= 0.11
+            better = np.isfinite(pv) and np.isfinite(bv) and lbl not in (
+                "Annualised volatility", "Beta") and pv > bv
+            ax4.text(0.00, y, lbl, fontsize=7, color=MP["text"], transform=ax4.transAxes)
+            ax4.text(0.62, y, f(pv, k), fontsize=7, ha="right", transform=ax4.transAxes,
+                     color=MP["pos"] if better else MP["text"], fontweight="bold")
+            ax4.text(0.98, y, f(bv, k), fontsize=7, ha="right", color=MP["sub"],
+                     transform=ax4.transAxes)
+        ax4.set_title(f"Metrics  (rf = {b['rf']:.2%})")
+
+        verdict = "OUTPERFORMS" if b["outperf"] >= 0 else "UNDERPERFORMS"
+        fig.suptitle(f"Portfolio {verdict} the {BENCHMARK_NAME} by {b['outperf']:+.2%}"
+                     f"  ·  α = {b['alpha']:+.2%} / year",
+                     color=MP["pos"] if b["outperf"] >= 0 else MP["danger"],
+                     fontsize=11, fontweight="bold")
+        self._replace_chart("bench", fig)
+
     def _plot_gbm(self, mu, cov, weights, n_sims, n_days, initial_val, show_shocks, names):
         """
         Geometric Brownian Motion projection of the optimised portfolio.
